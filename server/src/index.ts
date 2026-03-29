@@ -1,5 +1,5 @@
 import { WebSocketServer, WebSocket } from "ws";
-import { User, Game, WSMessage } from "./types.js";
+import { User, Game, Question, WSMessage } from "./types.js";
 import { randomUUID } from "crypto";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
@@ -54,6 +54,51 @@ function handleReg(ws: WebSocket, data: { name: string; password: string }) {
   });
 }
 
+function generateCode(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+function handleCreateGame(ws: WebSocket, data: { questions: Question[] }) {
+  const user = socketToUser.get(ws);
+  if (!user) {
+    send(ws, "error", { message: "Not registered" });
+    return;
+  }
+
+  if (!data.questions || data.questions.length === 0) {
+    send(ws, "error", { message: "No questions provided" });
+    return;
+  }
+
+  const gameId = randomUUID();
+  const code = generateCode();
+
+  const game: Game = {
+    id: gameId,
+    code,
+    hostId: user.index,
+    questions: data.questions,
+    players: [],
+    currentQuestion: -1,
+    status: "waiting",
+    playerAnswers: new Map(),
+  };
+
+  games.set(gameId, game);
+
+  send(ws, "game_created", {
+    gameId,
+    code,
+  });
+
+  console.log(`Game created: ${code} by ${user.name}`);
+}
+
 wss.on("connection", (ws) => {
   console.log("Client connected");
 
@@ -77,7 +122,7 @@ wss.on("connection", (ws) => {
         handleReg(ws, data);
         break;
       case "create_game":
-        console.log("create_game", data);
+        handleCreateGame(ws, data);
         break;
       case "join_game":
         console.log("join_game", data);
