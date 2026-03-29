@@ -162,6 +162,69 @@ function broadcastToGame(game: Game, type: string, data: unknown) {
   }
 }
 
+function handleStartGame(ws: WebSocket, data: { gameId: string }) {
+  const user = socketToUser.get(ws);
+  if (!user) {
+    send(ws, "error", { message: "Not registered" });
+    return;
+  }
+
+  const game = games.get(data.gameId);
+  if (!game) {
+    send(ws, "error", { message: "Game not found" });
+    return;
+  }
+
+  if (game.hostId !== user.index) {
+    send(ws, "error", { message: "Only the host can start the game" });
+    return;
+  }
+
+  if (game.status !== "waiting") {
+    send(ws, "error", { message: "Game already started" });
+    return;
+  }
+
+  if (game.players.length === 0) {
+    send(ws, "error", { message: "No players in game" });
+    return;
+  }
+
+  game.status = "in_progress";
+  game.currentQuestion = 0;
+
+  broadcastQuestion(game);
+}
+
+function broadcastQuestion(game: Game) {
+  const question = game.questions[game.currentQuestion];
+
+  game.questionStartTime = Date.now();
+  game.playerAnswers = new Map();
+
+  for (const player of game.players) {
+    player.hasAnswered = false;
+    player.answeredCorrectly = false;
+    player.answerTime = undefined;
+  }
+
+  broadcastToGame(game, "question", {
+    questionNumber: game.currentQuestion + 1,
+    totalQuestions: game.questions.length,
+    text: question.text,
+    options: question.options,
+    timeLimitSec: question.timeLimitSec,
+  });
+
+  console.log(
+    `Question ${game.currentQuestion + 1} sent for game ${game.code}`,
+  );
+
+  game.questionTimer = setTimeout(() => {
+    endQuestion(game);
+  }, question.timeLimitSec * 1000);
+}
+
 wss.on("connection", (ws) => {
   console.log("Client connected");
 
@@ -191,7 +254,7 @@ wss.on("connection", (ws) => {
         handleJoinGame(ws, data);
         break;
       case "start_game":
-        console.log("start_game", data);
+        handleStartGame(ws, data);
         break;
       case "answer":
         console.log("answer", data);
