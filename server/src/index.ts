@@ -282,6 +282,85 @@ function handleAnswer(
   }
 }
 
+function endQuestion(game: Game) {
+  const question = game.questions[game.currentQuestion];
+  const basePoints = 1000;
+
+  const playerResults = game.players.map((player) => {
+    const answer = game.playerAnswers.get(player.index);
+
+    if (!answer) {
+      return {
+        name: player.name,
+        answered: false,
+        correct: false,
+        pointsEarned: 0,
+        totalScore: player.score,
+      };
+    }
+
+    const isCorrect = answer.answerIndex === question.correctIndex;
+
+    let pointsEarned = 0;
+    if (isCorrect && game.questionStartTime) {
+      const timeRemaining =
+        question.timeLimitSec -
+        (answer.timestamp - game.questionStartTime) / 1000;
+      const clampedTime = Math.max(0, timeRemaining);
+      pointsEarned = Math.round(
+        basePoints * (clampedTime / question.timeLimitSec),
+      );
+    }
+
+    player.score += pointsEarned;
+
+    return {
+      name: player.name,
+      answered: true,
+      correct: isCorrect,
+      pointsEarned,
+      totalScore: player.score,
+    };
+  });
+
+  broadcastToGame(game, "question_result", {
+    questionIndex: game.currentQuestion,
+    correctIndex: question.correctIndex,
+    playerResults,
+  });
+
+  console.log(
+    `Question ${game.currentQuestion + 1} ended for game ${game.code}`,
+  );
+
+  const isLastQuestion = game.currentQuestion === game.questions.length - 1;
+
+  if (isLastQuestion) {
+    endGame(game);
+  } else {
+    game.currentQuestion++;
+    setTimeout(() => {
+      broadcastQuestion(game);
+    }, 3000);
+  }
+}
+
+function endGame(game: Game) {
+  game.status = "finished";
+
+  const sorted = [...game.players].sort((a, b) => b.score - a.score);
+
+  const scoreboard = sorted.map((player, i) => ({
+    name: player.name,
+    score: player.score,
+    rank: i + 1,
+  }));
+
+  broadcastToGame(game, "game_finished", { scoreboard });
+
+  console.log(`Game ${game.code} finished`);
+}
+
 wss.on("connection", (ws) => {
   console.log("Client connected");
 
@@ -314,7 +393,7 @@ wss.on("connection", (ws) => {
         handleStartGame(ws, data);
         break;
       case "answer":
-        console.log("answer", data);
+        handleAnswer(ws, data);
         break;
       default:
         console.log("Unknown message type:", message.type);
