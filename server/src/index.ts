@@ -401,7 +401,47 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    console.log("Client disconnected");
+    const user = socketToUser.get(ws);
+    if (!user) return;
+
+    console.log(`${user.name} disconnected`);
+
+    for (const game of games.values()) {
+      if (game.status === "finished") continue;
+
+      const playerIndex = game.players.findIndex((p) => p.index === user.index);
+      if (playerIndex === -1) continue;
+
+      game.players.splice(playerIndex, 1);
+
+      broadcastToGame(
+        game,
+        "update_players",
+        game.players.map((p) => ({
+          name: p.name,
+          index: p.index,
+          score: p.score,
+        })),
+      );
+
+      console.log(`${user.name} removed from game ${game.code}`);
+
+      if (game.status === "in_progress" && game.players.length > 0) {
+        const allAnswered = game.players.every((p) => p.hasAnswered);
+        if (allAnswered) {
+          if (game.questionTimer) clearTimeout(game.questionTimer);
+          endQuestion(game);
+        }
+      }
+
+      if (game.players.length === 0) {
+        if (game.questionTimer) clearTimeout(game.questionTimer);
+        games.delete(game.id);
+        console.log(`Game ${game.code} deleted — no players left`);
+      }
+    }
+
+    socketToUser.delete(ws);
   });
 
   ws.on("error", (err) => {
