@@ -225,6 +225,63 @@ function broadcastQuestion(game: Game) {
   }, question.timeLimitSec * 1000);
 }
 
+function handleAnswer(
+  ws: WebSocket,
+  data: { gameId: string; questionIndex: number; answerIndex: number },
+) {
+  const user = socketToUser.get(ws);
+  if (!user) {
+    send(ws, "error", { message: "Not registered" });
+    return;
+  }
+
+  const game = games.get(data.gameId);
+  if (!game) {
+    send(ws, "error", { message: "Game not found" });
+    return;
+  }
+
+  if (game.status !== "in_progress") {
+    send(ws, "error", { message: "Game is not in progress" });
+    return;
+  }
+
+  if (data.questionIndex !== game.currentQuestion) {
+    send(ws, "error", { message: "Wrong question index" });
+    return;
+  }
+
+  const player = game.players.find((p) => p.index === user.index);
+  if (!player) {
+    send(ws, "error", { message: "Player not in game" });
+    return;
+  }
+
+  if (player.hasAnswered) {
+    send(ws, "error", { message: "Already answered" });
+    return;
+  }
+
+  player.hasAnswered = true;
+  player.answerTime = Date.now();
+  game.playerAnswers.set(user.index, {
+    answerIndex: data.answerIndex,
+    timestamp: player.answerTime,
+  });
+
+  send(ws, "answer_accepted", { questionIndex: data.questionIndex });
+
+  console.log(
+    `${user.name} answered question ${data.questionIndex} in game ${game.code}`,
+  );
+
+  const allAnswered = game.players.every((p) => p.hasAnswered);
+  if (allAnswered) {
+    if (game.questionTimer) clearTimeout(game.questionTimer);
+    endQuestion(game);
+  }
+}
+
 wss.on("connection", (ws) => {
   console.log("Client connected");
 
