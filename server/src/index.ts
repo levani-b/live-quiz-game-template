@@ -99,6 +99,69 @@ function handleCreateGame(ws: WebSocket, data: { questions: Question[] }) {
   console.log(`Game created: ${code} by ${user.name}`);
 }
 
+function handleJoinGame(ws: WebSocket, data: { code: string }) {
+  const user = socketToUser.get(ws);
+  if (!user) {
+    send(ws, "error", { message: "Not registered" });
+    return;
+  }
+
+  const game = [...games.values()].find((g) => g.code === data.code);
+  if (!game) {
+    send(ws, "error", { message: "Game not found" });
+    return;
+  }
+
+  if (game.status !== "waiting") {
+    send(ws, "error", { message: "Game already started" });
+    return;
+  }
+
+  const alreadyJoined = game.players.find((p) => p.index === user.index);
+  if (alreadyJoined) {
+    alreadyJoined.ws = ws;
+    send(ws, "game_joined", { gameId: game.id });
+    return;
+  }
+
+  const player = {
+    name: user.name,
+    index: user.index,
+    score: 0,
+    ws,
+  };
+
+  game.players.push(player);
+
+  send(ws, "game_joined", { gameId: game.id });
+
+  broadcastToGame(game, "player_joined", {
+    playerName: user.name,
+    playerCount: game.players.length,
+  });
+
+  broadcastToGame(
+    game,
+    "update_players",
+    game.players.map((p) => ({
+      name: p.name,
+      index: p.index,
+      score: p.score,
+    })),
+  );
+
+  console.log(`${user.name} joined game ${game.code}`);
+}
+
+function broadcastToGame(game: Game, type: string, data: unknown) {
+  const host = [...users.values()].find((u) => u.index === game.hostId);
+  if (host?.ws) send(host.ws, type, data);
+
+  for (const player of game.players) {
+    if (player.ws) send(player.ws, type, data);
+  }
+}
+
 wss.on("connection", (ws) => {
   console.log("Client connected");
 
@@ -125,7 +188,7 @@ wss.on("connection", (ws) => {
         handleCreateGame(ws, data);
         break;
       case "join_game":
-        console.log("join_game", data);
+        handleJoinGame(ws, data);
         break;
       case "start_game":
         console.log("start_game", data);
