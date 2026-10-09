@@ -1,7 +1,452 @@
-import { WebSocketServer } from 'ws';
-
+import { WebSocketServer, WebSocket } from "ws";
+import { User, Game, Question, WSMessage } from "./types.js";
+import { randomUUID } from "crypto";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
 // WebSocket server
 const wss = new WebSocketServer({ port: PORT });
+
+const users = new Map<string, User>();
+const games = new Map<string, Game>();
+
+const socketToUser = new Map<WebSocket, User>();
+
+function send(ws: WebSocket, type: string, data: unknown) {
+  const message: WSMessage = { type, data, id: 0 };
+  ws.send(JSON.stringify(message));
+}
+
+function handleReg(ws: WebSocket, data: { name: string; password: string }) {
+  const existing = [...users.values()].find((u) => u.name === data.name);
+
+  if (existing) {
+    if (existing.password !== data.password) {
+      send(ws, "reg", {
+        name: data.name,
+        index: "",
+        error: true,
+        errorText: "Wrong password",
+      });
+      return;
+    }
+    existing.ws = ws;
+    socketToUser.set(ws, existing);
+    send(ws, "reg", {
+      name: existing.name,
+      index: existing.index,
+      error: false,
+      errorText: "",
+    });
+    return;
+  }
+
+  const index = crypto.randomUUID();
+  const user: User = { name: data.name, password: data.password, index, ws };
+  users.set(index, user);
+  socketToUser.set(ws, user);
+
+  send(ws, "reg", {
+    name: user.name,
+    index: user.index,
+    error: false,
+    errorText: "",
+  });
+}
+
+function generateCode(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+function handleCreateGame(ws: WebSocket, data: { questions: Question[] }) {
+  const user = socketToUser.get(ws);
+  if (!user) {
+    send(ws, "error", { message: "Not registered" });
+    return;
+  }
+
+  if (!data.questions || data.questions.length === 0) {
+    send(ws, "error", { message: "No questions provided" });
+    return;
+  }
+
+  const gameId = randomUUID();
+  const code = generateCode();
+
+  const game: Game = {
+    id: gameId,
+    code,
+    hostId: user.index,
+    questions: data.questions,
+    players: [],
+    currentQuestion: -1,
+    status: "waiting",
+    playerAnswers: new Map(),
+  };
+
+  games.set(gameId, game);
+
+  send(ws, "game_created", {
+    gameId,
+    code,
+  });
+
+  console.log(`Game created: ${code} by ${user.name}`);
+}
+
+function handleJoinGame(ws: WebSocket, data: { code: string }) {
+  const user = socketToUser.get(ws);
+  if (!user) {
+    send(ws, "error", { message: "Not registered" });
+    return;
+  }
+
+  const game = [...games.values()].find((g) => g.code === data.code);
+  if (!game) {
+    send(ws, "error", { message: "Game not found" });
+    return;
+  }
+
+  if (game.status !== "waiting") {
+    send(ws, "error", { message: "Game already started" });
+    return;
+  }
+
+  const alreadyJoined = game.players.find((p) => p.index === user.index);
+  if (alreadyJoined) {
+    alreadyJoined.ws = ws;
+    send(ws, "game_joined", { gameId: game.id });
+    return;
+  }
+
+  const player = {
+    name: user.name,
+    index: user.index,
+    score: 0,
+    ws,
+  };
+
+  game.players.push(player);
+
+  send(ws, "game_joined", { gameId: game.id });
+
+  broadcastToGame(game, "player_joined", {
+    playerName: user.name,
+    playerCount: game.players.length,
+  });
+
+  broadcastToGame(
+    game,
+    "update_players",
+    game.players.map((p) => ({
+      name: p.name,
+      index: p.index,
+      score: p.score,
+    })),
+  );
+
+  console.log(`${user.name} joined game ${game.code}`);
+}
+
+function broadcastToGame(game: Game, type: string, data: unknown) {
+  const host = [...users.values()].find((u) => u.index === game.hostId);
+  if (host?.ws) send(host.ws, type, data);
+
+  for (const player of game.players) {
+    if (player.ws) send(player.ws, type, data);
+  }
+}
+
+function handleStartGame(ws: WebSocket, data: { gameId: string }) {
+  const user = socketToUser.get(ws);
+  if (!user) {
+    send(ws, "error", { message: "Not registered" });
+    return;
+  }
+
+  const game = games.get(data.gameId);
+  if (!game) {
+    send(ws, "error", { message: "Game not found" });
+    return;
+  }
+
+  if (game.hostId !== user.index) {
+    send(ws, "error", { message: "Only the host can start the game" });
+    return;
+  }
+
+  if (game.status !== "waiting") {
+    send(ws, "error", { message: "Game already started" });
+    return;
+  }
+
+  if (game.players.length === 0) {
+    send(ws, "error", { message: "No players in game" });
+    return;
+  }
+
+  game.status = "in_progress";
+  game.currentQuestion = 0;
+
+  broadcastQuestion(game);
+}
+
+function broadcastQuestion(game: Game) {
+  const question = game.questions[game.currentQuestion];
+
+  game.questionStartTime = Date.now();
+  game.playerAnswers = new Map();
+
+  for (const player of game.players) {
+    player.hasAnswered = false;
+    player.answeredCorrectly = false;
+    player.answerTime = undefined;
+  }
+
+  broadcastToGame(game, "question", {
+    questionNumber: game.currentQuestion + 1,
+    totalQuestions: game.questions.length,
+    text: question.text,
+    options: question.options,
+    timeLimitSec: question.timeLimitSec,
+  });
+
+  console.log(
+    `Question ${game.currentQuestion + 1} sent for game ${game.code}`,
+  );
+
+  game.questionTimer = setTimeout(() => {
+    endQuestion(game);
+  }, question.timeLimitSec * 1000);
+}
+
+function handleAnswer(
+  ws: WebSocket,
+  data: { gameId: string; questionIndex: number; answerIndex: number },
+) {
+  const user = socketToUser.get(ws);
+  if (!user) {
+    send(ws, "error", { message: "Not registered" });
+    return;
+  }
+
+  const game = games.get(data.gameId);
+  if (!game) {
+    send(ws, "error", { message: "Game not found" });
+    return;
+  }
+
+  if (game.status !== "in_progress") {
+    send(ws, "error", { message: "Game is not in progress" });
+    return;
+  }
+
+  if (data.questionIndex !== game.currentQuestion) {
+    send(ws, "error", { message: "Wrong question index" });
+    return;
+  }
+
+  const player = game.players.find((p) => p.index === user.index);
+  if (!player) {
+    send(ws, "error", { message: "Player not in game" });
+    return;
+  }
+
+  if (player.hasAnswered) {
+    send(ws, "error", { message: "Already answered" });
+    return;
+  }
+
+  player.hasAnswered = true;
+  player.answerTime = Date.now();
+  game.playerAnswers.set(user.index, {
+    answerIndex: data.answerIndex,
+    timestamp: player.answerTime,
+  });
+
+  send(ws, "answer_accepted", { questionIndex: data.questionIndex });
+
+  console.log(
+    `${user.name} answered question ${data.questionIndex} in game ${game.code}`,
+  );
+
+  const allAnswered = game.players.every((p) => p.hasAnswered);
+  if (allAnswered) {
+    if (game.questionTimer) clearTimeout(game.questionTimer);
+    endQuestion(game);
+  }
+}
+
+function endQuestion(game: Game) {
+  const question = game.questions[game.currentQuestion];
+  const basePoints = 1000;
+
+  const playerResults = game.players.map((player) => {
+    const answer = game.playerAnswers.get(player.index);
+
+    if (!answer) {
+      return {
+        name: player.name,
+        answered: false,
+        correct: false,
+        pointsEarned: 0,
+        totalScore: player.score,
+      };
+    }
+
+    const isCorrect = answer.answerIndex === question.correctIndex;
+
+    let pointsEarned = 0;
+    if (isCorrect && game.questionStartTime) {
+      const timeRemaining =
+        question.timeLimitSec -
+        (answer.timestamp - game.questionStartTime) / 1000;
+      const clampedTime = Math.max(0, timeRemaining);
+      pointsEarned = Math.round(
+        basePoints * (clampedTime / question.timeLimitSec),
+      );
+    }
+
+    player.score += pointsEarned;
+
+    return {
+      name: player.name,
+      answered: true,
+      correct: isCorrect,
+      pointsEarned,
+      totalScore: player.score,
+    };
+  });
+
+  broadcastToGame(game, "question_result", {
+    questionIndex: game.currentQuestion,
+    correctIndex: question.correctIndex,
+    playerResults,
+  });
+
+  console.log(
+    `Question ${game.currentQuestion + 1} ended for game ${game.code}`,
+  );
+
+  const isLastQuestion = game.currentQuestion === game.questions.length - 1;
+
+  if (isLastQuestion) {
+    endGame(game);
+  } else {
+    game.currentQuestion++;
+    setTimeout(() => {
+      broadcastQuestion(game);
+    }, 3000);
+  }
+}
+
+function endGame(game: Game) {
+  game.status = "finished";
+
+  const sorted = [...game.players].sort((a, b) => b.score - a.score);
+
+  const scoreboard = sorted.map((player, i) => ({
+    name: player.name,
+    score: player.score,
+    rank: i + 1,
+  }));
+
+  broadcastToGame(game, "game_finished", { scoreboard });
+
+  console.log(`Game ${game.code} finished`);
+}
+
+wss.on("connection", (ws) => {
+  console.log("Client connected");
+
+  ws.on("message", (raw) => {
+    let message: WSMessage;
+
+    try {
+      message = JSON.parse(raw.toString());
+    } catch {
+      console.error("Failed to parse message:", raw.toString());
+      return;
+    }
+
+    const data =
+      typeof message.data === "string"
+        ? JSON.parse(message.data)
+        : message.data;
+
+    switch (message.type) {
+      case "reg":
+        handleReg(ws, data);
+        break;
+      case "create_game":
+        handleCreateGame(ws, data);
+        break;
+      case "join_game":
+        handleJoinGame(ws, data);
+        break;
+      case "start_game":
+        handleStartGame(ws, data);
+        break;
+      case "answer":
+        handleAnswer(ws, data);
+        break;
+      default:
+        console.log("Unknown message type:", message.type);
+    }
+  });
+
+  ws.on("close", () => {
+    const user = socketToUser.get(ws);
+    if (!user) return;
+
+    console.log(`${user.name} disconnected`);
+
+    for (const game of games.values()) {
+      if (game.status === "finished") continue;
+
+      const playerIndex = game.players.findIndex((p) => p.index === user.index);
+      if (playerIndex === -1) continue;
+
+      game.players.splice(playerIndex, 1);
+
+      broadcastToGame(
+        game,
+        "update_players",
+        game.players.map((p) => ({
+          name: p.name,
+          index: p.index,
+          score: p.score,
+        })),
+      );
+
+      console.log(`${user.name} removed from game ${game.code}`);
+
+      if (game.status === "in_progress" && game.players.length > 0) {
+        const allAnswered = game.players.every((p) => p.hasAnswered);
+        if (allAnswered) {
+          if (game.questionTimer) clearTimeout(game.questionTimer);
+          endQuestion(game);
+        }
+      }
+
+      if (game.players.length === 0) {
+        if (game.questionTimer) clearTimeout(game.questionTimer);
+        games.delete(game.id);
+        console.log(`Game ${game.code} deleted — no players left`);
+      }
+    }
+
+    socketToUser.delete(ws);
+  });
+
+  ws.on("error", (err) => {
+    console.error("WebSocket error:", err);
+  });
+});
+
+console.log(`WebSocket server running on ws://localhost:${PORT}`);
